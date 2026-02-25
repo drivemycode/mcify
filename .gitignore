@@ -2,4 +2,3 @@ benchmark.py
 *.png
 *.jpg
 *.jpeg
-__pycache__
