@@ -1,96 +1,132 @@
-import cv2
+from __future__ import annotations 
+from dataclasses import dataclass
+from typing import Dict, Tuple, List, Optional
+
 from PIL import Image
 import numpy as np
+import minecraft_blocks
 
-MAP_SIZE = (512, 512)
-MINECRAFT_BLOCKS = {
-    "white_wool": (233, 236, 236),
-    "orange_wool": (240, 118, 19),
-    "magenta_wool": (189, 68, 179),
-    "light_blue_wool": (58, 175, 217),
-    "yellow_wool": (248, 198, 39),
-    "lime_wool": (112, 185, 25),
-    "pink_wool": (237, 141, 172),
-    "gray_wool": (62, 68, 71),
-    "light_gray_wool": (142, 142, 134),
-    "cyan_wool": (21, 137, 145),
-    "purple_wool": (121, 42, 172),
-    "blue_wool": (53, 57, 157),
-    "brown_wool": (114, 71, 40),
-    "green_wool": (84, 109, 27),
-    "red_wool": (161, 39, 34),
-    "black_wool": (20, 21, 25),
-    "white_concrete": (207, 213, 214),
-    "orange_concrete": (224, 97, 0),
-    "magenta_concrete": (169, 48, 159),
-    "light_blue_concrete": (36, 137, 199),
-    "yellow_concrete": (241, 175, 21),
-    "lime_concrete": (94, 168, 24),
-    "pink_concrete": (214, 101, 143),
-    "gray_concrete": (54, 57, 61),
-    "light_gray_concrete": (125, 125, 115),
-    "cyan_concrete": (21, 119, 136),
-    "purple_concrete": (100, 32, 156),
-    "blue_concrete": (44, 46, 143),
-    "brown_concrete": (96, 59, 31),
-    "green_concrete": (73, 91, 36),
-    "red_concrete": (142, 32, 32),
-    "black_concrete": (8, 10, 15),
-}
+# -----
+# Palette handling
+# -----
 
-def pixelate(img_path, pixel_size):
-    img = cv2.imread(img_path)
-    if img is None:
-        raise FileNotFoundError(f"Could not read image: {img_path}")
+RGB = Tuple[int, int, int]
 
-    h,w = img.shape[:2]
-    
-    temp = cv2.resize(img, (w // pixel_size, h//pixel_size), interpolation=cv2.INTER_LINEAR)
-    pixelated_img = cv2.resize(temp, MAP_SIZE, interpolation=cv2.INTER_NEAREST)
+@dataclass(frozen=True)
+class Palette:
+    names: List[str] # length K
+    rgb: np.ndarray # shape (K, 3), float32
 
-    cv2.imshow("Pixelated image", pixelated_img)
-    cv2.waitKey(0)
+    @staticmethod
+    def from_blocks(blocks: Dict[str, RGB]) -> "Palette":
+        names = list(blocks.keys())
+        rgb = np.array([blocks[n] for n in names], dtype=np.float32)
+        return Palette(names=names, rgb=rgb)
 
-    cv2.destroyAllWindows()
 
-def build_palette(blocks_dict):
-    names = list(blocks_dict.keys())
-    rgb = np.array([blocks_dict[n] for n in names], dtype=np.uint8)
+# -----
+# Nearest-color matching
+# -----
+def nearest_index_rgb(color_rgb: np.ndarray, palette_rgb: np.ndarray) -> int:
+    """
+    color_rgb: shape (3,), float32
+    palette_rgb: shape (K,3), float32
+    returns: int index of nearest palette color by squared Euclidean distance
+    """
+    c = color_rgb 
+    p = palette_rgb
+    dist2 = np.sum(p * p, axis=1) - 2.0 * (p @ c) + float(c @ c)            
+    return int(np.argmin(dist2))
 
-    lab = cv2.cvtColor(rgb.reshape(1, -1, 3), cv2.COLOR_RGB2LAB)
-    lab = lab.reshape(-1, 3).astype(np.int16)
+# -----
+# Dithering
+# -----
+def dither_fs_serpentine(img_rgb: np.ndarray, 
+                         palette: Palette, 
+                         clamp: bool = True
+                         ) -> np.ndarray:
+    arr = img_rgb.astype(np.float32, copy=True)
+    H, W, _ = arr.shape
+    idx = np.zeros((H, W), dtype=np.int32)
+    pal = palette.rgb # (K, 3)
 
-    return names, lab
+    for y in range(H):
+        # choose scan direction
+        if y % 2 == 0:
+            x_iter = range(W)              # left -> right
+            dirx = 1
+        else:
+            x_iter = range(W-1, -1, -1)     # right -> left
+            dirx = -1
 
-def match_blocks(image_path, blocks_dict, out_size=(512, 512)):
-    img = Image.open(image_path).convert("RGB").resize(out_size, Image.NEAREST)
-    rgb_img = np.array(img, dtype=np.uint8)
+        for x in x_iter:
+            # clamp BEFORE matching to avoid runaway colors
+            if clamp:
+                arr[y, x] = np.clip(arr[y, x], 0.0, 255.0)
 
-    lab_img = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2LAB).astype(np.int16)
-    names, lab_palette = build_palette(blocks_dict)
+            old = arr[y, x]
+            k = nearest_index_rgb(old, pal)
+            idx[y, x] = k
+            new = pal[k]
+            err = old - new
 
-    # for every pixel, for every block in lab palette, the 3 number 
-    # vector difference
-    diff = lab_img[:, :, None, :] - lab_palette[None, None, :, :]
-    
-    # diff has shape: [y, x, K, 3].
-    # y:= height pixels
-    # x:= width pixels
-    # K:= lab color palette blocks: (lightness, green-red, blue-yellow). (0-100)
-    dist2 = np.sum(diff * diff, axis = 3) 
-    best = np.argmin(dist2, axis=2)  # axis=2 is the layer [wool1, wool2, .. woolK]
+            # diffuse error (mirrored when scanning right->left)
+            x1 = x + dirx
+            if 0 <= x1 < W:
+                arr[y, x1] += err * (7/16)
 
-    grid = np.vectorize(lambda i: names[i])(best)
-    return grid, best
+            if y + 1 < H:
+                # below
+                arr[y+1, x] += err * (5/16)
 
-def preview_from_indices(indices, blocks_dict):
-    names = list(blocks_dict.keys())
-    palette_rgb = np.array([blocks_dict[n] for n in names], dtype=np.uint8)
-    return Image.fromarray(palette_rgb[indices])
+                # below-left and below-right depend on direction
+                xl = x - dirx
+                xr = x + dirx
+                if 0 <= xl < W:
+                    arr[y+1, xl] += err * (3/16)
+                if 0 <= xr < W:
+                    arr[y+1, xr] += err * (1/16)
+
+    return idx
+
+# -----
+# I/O helpers (loading, preview)
+# -----
+def load_image_rgb(path: str, 
+                   out_size: Tuple[int, int], 
+                   resize_mode: int = Image.BILINEAR
+                   ) -> np.ndarray:
+    img = Image.open(path).convert("RGB").resize(out_size, resize_mode)
+    return np.array(img, dtype=np.float32) # (H, W, 3) float32
+
+def indices_to_grid(idx: np.ndarray, palette: Palette) -> np.ndarray:
+    names = np.array(palette.names, dtype=object)
+    return names[idx]
+
+def preview_from_indices(idx: np.ndarray, palette: Palette) -> Image.Image:
+    rgb = palette.rgb.astype(np.uint8)
+    preview = rgb[idx]
+    return Image.fromarray(preview, mode="RGB")
+
+# -----
+# End to end convenience
+# -----
+def mosaic_dither(
+        image_path: str,
+        blocks: Dict[str, RGB],
+        out_size: Tuple[int, int] = (512, 512),
+        resize_mode: int = Image.BILINEAR,
+        clamp: bool = True
+):
+    palette = Palette.from_blocks(blocks)
+    img_rgb = load_image_rgb(image_path, out_size, resize_mode=resize_mode)
+    idx = dither_fs_serpentine(img_rgb, palette, clamp=clamp)
+    grid = indices_to_grid(idx, palette)
+    preview = preview_from_indices(idx, palette)
+
+    return grid, idx, preview
 
 if __name__ == "__main__":
-    # grid, idx = match_blocks("gym.png", MINECRAFT_BLOCKS)
-    grid, idx = match_blocks("room.jpeg", MINECRAFT_BLOCKS)
-
-    preview_img = preview_from_indices(idx, MINECRAFT_BLOCKS)
-    preview_img.show("preview.png")
+    grid, idx, preview = mosaic_dither("gym.png", minecraft_blocks.MINECRAFT_BLOCKS)
+    preview.show("preview.png")
+    print(grid[0, :10])
