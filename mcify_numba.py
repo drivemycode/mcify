@@ -6,6 +6,7 @@ from typing import Dict, Tuple, List
 import numpy as np
 from PIL import Image
 from numba import njit
+from pathlib import Path
 
 import minecraft_blocks
 
@@ -123,7 +124,7 @@ def dither_fs_serpentine_numba(img_rgb_float, palette_rgb_float, clamp_enabled=T
 def mosaic_dither_numba(
     image_path: str,
     blocks: Dict[str, RGB],
-    out_size: Tuple[int, int] = (512, 512),
+    out_size: Tuple[int, int] = (128, 128),
     resize_mode: int = Image.BILINEAR,
     clamp: bool = True,
 ):
@@ -143,7 +144,45 @@ def mosaic_dither_numba(
     preview = preview_from_indices(idx, palette)
     return grid, idx, preview
 
+
+def write_mcfunction_flat(grid: np.ndarray, 
+                          out_path: str, 
+                          origin: Tuple[int, int, int] = (0, 64, 0), 
+                          namespace: str = "minecraft", 
+                          center: bool = False):
+    """
+    grid: (H,W) array of block names (strings)
+    origin: (x0,y0,z0) in Minecraft
+    center: if True, center mosaic around origin
+    """
+    H, W = grid.shape
+    x0, y0, z0 = origin
+
+    o_path = Path(out_path)
+    o_path.parent.mkdir(parents=True, exist_ok=True)
+    o_path.touch(exist_ok=True) 
+
+    lines = []
+    for y in range(H):
+        for x in range(W):
+            name = grid[y, x]
+            wx = x0 + x
+            wz = z0 + y
+            if center:
+                wx = x0 + (x - W // 2)
+                wz = z0 + (y - H // 2)
+
+            # skip "air" if you ever include it
+            if name == "air":
+                continue
+
+            lines.append(f"setblock {wx} {y0} {wz} {namespace}:{name}")
+
+    o_path.write_text("\n".join(lines), encoding="utf-8")
+
 if __name__ == "__main__":
-    grid, idx, preview = mosaic_dither_numba("person.jpg", minecraft_blocks.MINECRAFT_BLOCKS)
-    preview.show("preview.png")
-    print(grid[0, :10])
+    grid, idx, preview = mosaic_dither_numba("clinic.jpeg", minecraft_blocks.MINECRAFT_BLOCKS)
+    write_mcfunction_flat(grid, "out/mcify.mcfunction")
+    
+    # preview.show("preview.png")
+    # print(grid)                         
